@@ -98,11 +98,11 @@ def reciprocal_rank_fusion(dense_res: List[Dict], sparse_res: List[Dict], k: int
         for cid, score in sorted_chunks
     ]
 
-def hybrid_search(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-    """Executes both search modes and blends them using RRF."""
-    # Fetch extra candidates to allow intersection sorting
-    d_results = dense_search(query, top_k=top_k * 2)
-    s_results = sparse_search(query, top_k=top_k * 2)
+def hybrid_search(query: str, top_k: int = 2) -> List[Dict[str, Any]]:
+    """Executes both search modes and blends them using RRF with optimized constraints."""
+    # Fetch a controlled number of candidates to prevent low-quality ranks from fusing
+    d_results = dense_search(query, top_k=4)
+    s_results = sparse_search(query, top_k=4)
     
     merged = reciprocal_rank_fusion(d_results, s_results)
     return merged[:top_k]

@@ -3,3 +3,9 @@ __pycache__/
 .env
 qdrant_data/
 data/
+# Ignore Local AI Models and large binaries
+ollama/
+models/
+.ollama/
+*.gguf
+*.bin
