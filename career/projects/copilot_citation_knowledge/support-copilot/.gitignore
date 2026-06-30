@@ -3,7 +3,7 @@
 # =========================
 /backend/qdrant_local_data/
 /backend/data/chunks.json
-
+qdrant_data/
 # =========================
 # Environment Variables
 # =========================
