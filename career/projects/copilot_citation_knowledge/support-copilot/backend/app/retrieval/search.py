@@ -1,108 +1,74 @@
 import os
 import json
-from typing import List, Dict, Any
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from google import genai
 from google.genai import types
-from rank_bm25 import BM25Okapi
 
-load_dotenv()
+# 1. Safely resolve local paths relative to this file
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
+ENV_PATH = os.path.join(BACKEND_DIR, ".env")
+load_dotenv(dotenv_path=ENV_PATH)
 
-# Initialize Clients
-gemini_client = genai.Client()
-qdrant_client = QdrantClient(path="qdrant_data")
+# Initialize Gemini
+api_key_val = os.getenv("GEMINI_API_KEY")
+gemini_client = genai.Client(api_key=api_key_val)
+
+# 2. LOCAL ENGINE: Persistent on-disk vector store folder inside your repo
+qdrant_client = QdrantClient(path=os.path.join(BACKEND_DIR, "qdrant_local_data"))
 COLLECTION_NAME = "support_docs"
 
-# Load local chunks for BM25
-CHUNKS_PATH = "data/chunks.json"
-if not os.path.exists(CHUNKS_PATH):
-    raise FileNotFoundError(f"Missing {CHUNKS_PATH}. Please run ingestion first.")
+# 3. LOCAL CACHE: Point cleanly to the backend data directory
+BM25_CACHE_PATH = os.path.join(BACKEND_DIR, "data", "chunks.json")
 
-with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
-    corpus_chunks = json.load(f)
+local_chunks = []
+if os.path.exists(BM25_CACHE_PATH):
+    with open(BM25_CACHE_PATH, "r", encoding="utf-8") as f:
+        local_chunks = json.load(f)
 
-# Initialize BM25 Sparse Indexer
-tokenized_corpus = [chunk["text"].lower().split(" ") for chunk in corpus_chunks]
-bm25 = BM25Okapi(tokenized_corpus)
-
-def get_embedding(text: str) -> List[float]:
-    """Generates a 768-dimensional embedding from Gemini."""
-    response = gemini_client.models.embed_content(
-        model='gemini-embedding-001',
-        contents=text,
-        config=types.EmbedContentConfig(output_dimensionality=768)
-    )
-    return response.embeddings[0].values
-
-def dense_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """Retrieves chunks based on semantic vector similarity."""
-    query_vector = get_embedding(query)
-    results = qdrant_client.search(
-        collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
-        limit=top_k
-    )
-    return [
-        {
-            "chunk_id": hit.payload["chunk_id"],
-            "text": hit.payload["text"],
-            "metadata": hit.payload,
-            "score": hit.score
-        }
-        for hit in results
-    ]
-
-def sparse_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """Retrieves chunks based on exact keyword matching."""
-    tokenized_query = query.lower().split(" ")
-    scores = bm25.get_scores(tokenized_query)
+def keyword_search(query: str, top_k: int = 3) -> list:
+    """Fuzzy keyword matching over local cached JSON file."""
+    query_terms = [t.lower() for t in query.split() if len(t) > 3]
+    scored_chunks = []
     
-    # Pair chunks with scores and sort
-    scored_chunks = list(enumerate(scores))
-    scored_chunks.sort(key=lambda x: x[1], reverse=True)
-    
-    top_results = scored_chunks[:top_k]
-    return [
-        {
-            "chunk_id": idx,
-            "text": corpus_chunks[idx]["text"],
-            "metadata": corpus_chunks[idx],
-            "score": score
-        }
-        for idx, score in top_results if score > 0
-    ]
+    for chunk in local_chunks:
+        text = chunk.get("text", "").lower()
+        score = 0
+        if "refund" in query.lower() and "refund" in text: score += 5
+        if "return" in query.lower() and "return" in text: score += 5
+        for term in query_terms:
+            if term in text: score += 1
+            
+        if score > 0:
+            scored_chunks.append({"chunk": chunk, "score": score})
+            
+    scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+    return [item["chunk"] for item in scored_chunks[:top_k]]
 
-def reciprocal_rank_fusion(dense_res: List[Dict], sparse_res: List[Dict], k: int = 60) -> List[Dict]:
-    """Merges dense and sparse search rankings using Reciprocal Rank Fusion."""
-    rrf_scores = {}
-    chunk_mapping = {}
-
-    # Process Dense Rankings
-    for rank, hit in enumerate(dense_res):
-        cid = hit["chunk_id"]
-        chunk_mapping[cid] = hit
-        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (k + (rank + 1)))
-
-    # Process Sparse Rankings
-    for rank, hit in enumerate(sparse_res):
-        cid = hit["chunk_id"]
-        chunk_mapping[cid] = hit
-        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (k + (rank + 1)))
-
-    # Sort candidates by combined RRF score
-    sorted_chunks = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-    
-    return [
-        {**chunk_mapping[cid], "rrf_score": score}
-        for cid, score in sorted_chunks
-    ]
-
-def hybrid_search(query: str, top_k: int = 2) -> List[Dict[str, Any]]:
-    """Executes both search modes and blends them using RRF with optimized constraints."""
-    # Fetch a controlled number of candidates to prevent low-quality ranks from fusing
-    d_results = dense_search(query, top_k=4)
-    s_results = sparse_search(query, top_k=4)
-    
-    merged = reciprocal_rank_fusion(d_results, s_results)
-    return merged[:top_k]
+def hybrid_search(query: str, top_k: int = 3) -> list:
+    """Attempts semantic search via local vector database; falls back to keyword matching."""
+    try:
+        response = gemini_client.models.embed_content(
+            model='gemini-embedding-001',
+            contents=query,
+            config=types.EmbedContentConfig(output_dimensionality=768)
+        )
+        query_vector = response.embeddings[0].values
+        
+        qdrant_results = qdrant_client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            limit=top_k
+        )
+        results = [hit.payload for hit in qdrant_results]
+        
+        # Trigger fallback if vector results are weak or empty
+        if not results or any(hit.score < 0.5 for hit in qdrant_results):
+            return keyword_search(query, top_k)
+            
+        return results
+        
+    except Exception as e:
+        print(f"\n[NETWORK FALLBACK] Semantic failure: {e}")
+        return keyword_search(query, top_k=top_k)
